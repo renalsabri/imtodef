@@ -2,17 +2,24 @@
 
 import React, { useState, useRef } from 'react';
 import { jsPDF } from 'jspdf';
+import { Capacitor } from '@capacitor/core';
+import { Filesystem, Directory } from '@capacitor/filesystem';
+import { Share } from '@capacitor/share';
 import { 
   Plus, 
   RotateCw, 
   Trash2, 
   ArrowUp, 
   ArrowDown, 
-  FileCheck2, 
   ArrowRight,
   ImageIcon,
   Loader2,
-  PenLine
+  PenLine,
+  Download,
+  Share2,
+  X,
+  Sparkles,
+  CheckCircle2
 } from 'lucide-react';
 
 interface UploadedImage {
@@ -28,7 +35,11 @@ export default function Home() {
   const [images, setImages] = useState<UploadedImage[]>([]);
   const [pdfName, setPdfName] = useState('');
   const [isGenerating, setIsGenerating] = useState(false);
-  const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [progressText, setProgressText] = useState('');
+  const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
+  const [savedNativeUri, setSavedNativeUri] = useState<string | null>(null);
+  const [savedFileName, setSavedFileName] = useState<string>('');
+  const [showNotification, setShowNotification] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Handle image files selection
@@ -49,7 +60,9 @@ export default function Home() {
     }));
 
     setImages((prev) => [...prev, ...newImages]);
-    setSuccessMessage(null);
+    setShowNotification(false);
+    setDownloadUrl(null);
+    setSavedNativeUri(null);
   };
 
   const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
@@ -90,50 +103,115 @@ export default function Home() {
     setImages(updated);
   };
 
-  // Convert image to rotated data URL using Canvas
+  // Safe and fast mobile-optimized Image processor
   const processImageToDataUrl = (
     imageItem: UploadedImage
   ): Promise<{ dataUrl: string; width: number; height: number }> => {
     return new Promise((resolve, reject) => {
       const img = new Image();
+      
+      const timeout = setTimeout(() => {
+        reject(new Error(`Timeout loading image: ${imageItem.name}`));
+      }, 10000);
+
       img.onload = () => {
-        const canvas = document.createElement('canvas');
-        const ctx = canvas.getContext('2d');
-        if (!ctx) {
-          reject(new Error('Canvas context not available'));
-          return;
+        clearTimeout(timeout);
+        try {
+          const maxDimension = 2048; // Safe size for mobile memory & crystal clear A4 print
+          let origWidth = img.naturalWidth || img.width;
+          let origHeight = img.naturalHeight || img.height;
+
+          // Scale down if image is huge from camera
+          if (origWidth > maxDimension || origHeight > maxDimension) {
+            if (origWidth > origHeight) {
+              origHeight = Math.round((origHeight * maxDimension) / origWidth);
+              origWidth = maxDimension;
+            } else {
+              origWidth = Math.round((origWidth * maxDimension) / origHeight);
+              origHeight = maxDimension;
+            }
+          }
+
+          const isRotatedQuarter =
+            imageItem.rotation === 90 || imageItem.rotation === 270;
+          const canvasWidth = isRotatedQuarter ? origHeight : origWidth;
+          const canvasHeight = isRotatedQuarter ? origWidth : origHeight;
+
+          const canvas = document.createElement('canvas');
+          canvas.width = canvasWidth;
+          canvas.height = canvasHeight;
+
+          const ctx = canvas.getContext('2d');
+          if (!ctx) {
+            reject(new Error('Canvas context not available'));
+            return;
+          }
+
+          ctx.translate(canvasWidth / 2, canvasHeight / 2);
+          ctx.rotate((imageItem.rotation * Math.PI) / 180);
+          ctx.drawImage(img, -origWidth / 2, -origHeight / 2, origWidth, origHeight);
+
+          const dataUrl = canvas.toDataURL('image/jpeg', 0.88);
+          resolve({
+            dataUrl,
+            width: canvasWidth,
+            height: canvasHeight,
+          });
+        } catch (err) {
+          reject(err);
         }
-
-        const isRotatedQuarter =
-          imageItem.rotation === 90 || imageItem.rotation === 270;
-        const width = isRotatedQuarter ? img.height : img.width;
-        const height = isRotatedQuarter ? img.width : img.height;
-
-        canvas.width = width;
-        canvas.height = height;
-
-        ctx.translate(canvas.width / 2, canvas.height / 2);
-        ctx.rotate((imageItem.rotation * Math.PI) / 180);
-        ctx.drawImage(img, -img.width / 2, -img.height / 2);
-
-        resolve({
-          dataUrl: canvas.toDataURL('image/jpeg', 0.92),
-          width,
-          height,
-        });
       };
-      img.onerror = reject;
+
+      img.onerror = () => {
+        clearTimeout(timeout);
+        reject(new Error(`Failed to load image: ${imageItem.name}`));
+      };
+
       img.src = imageItem.previewUrl;
     });
   };
 
-  // Generate and download PDF offline
+  // Direct manual download trigger for web
+  const triggerDownload = (url: string, filename: string) => {
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.rel = 'noopener noreferrer';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  };
+
+  // Native share handler for Android APK & Web
+  const handleOpenOrShare = async () => {
+    if (Capacitor.isNativePlatform() && savedNativeUri) {
+      try {
+        await Share.share({
+          title: savedFileName,
+          text: 'File PDF Anda:',
+          url: savedNativeUri,
+          dialogTitle: 'Buka atau Simpan PDF',
+        });
+      } catch (e: unknown) {
+        if ((e as Error).name !== 'AbortError') {
+          console.log('Share dismissed');
+        }
+      }
+    } else if (downloadUrl) {
+      triggerDownload(downloadUrl, savedFileName);
+    }
+  };
+
+  // Generate and save/download PDF offline
   const convertToPdf = async () => {
     if (images.length === 0 || isGenerating) return;
 
     try {
       setIsGenerating(true);
-      setSuccessMessage(null);
+      setShowNotification(false);
+      setDownloadUrl(null);
+      setSavedNativeUri(null);
+      setProgressText('Menyiapkan dokumen...');
 
       // Create PDF document (A4 format)
       const doc = new jsPDF({
@@ -147,6 +225,8 @@ export default function Home() {
       const margin = 10; // 10mm margins
 
       for (let i = 0; i < images.length; i++) {
+        setProgressText(`Memproses gambar ${i + 1} dari ${images.length}...`);
+        
         if (i > 0) {
           doc.addPage();
         }
@@ -166,37 +246,135 @@ export default function Home() {
         let posY = margin;
 
         if (imgRatio > pageRatio) {
-          // Wider than page ratio
           renderWidth = usableWidth;
           renderHeight = usableWidth / imgRatio;
           posY = margin + (usableHeight - renderHeight) / 2;
         } else {
-          // Taller than page ratio
           renderHeight = usableHeight;
           renderWidth = usableHeight * imgRatio;
           posX = margin + (usableWidth - renderWidth) / 2;
         }
 
-        doc.addImage(dataUrl, 'JPEG', posX, posY, renderWidth, renderHeight);
+        doc.addImage(dataUrl, 'JPEG', posX, posY, renderWidth, renderHeight, undefined, 'FAST');
       }
 
+      setProgressText('Menyimpan PDF ke HP...');
+
+      // Determine clean filename
       const cleanedName = pdfName.trim();
       const fileName = cleanedName
         ? (cleanedName.toLowerCase().endsWith('.pdf') ? cleanedName : `${cleanedName}.pdf`)
         : `converted_images_${Date.now()}.pdf`;
 
-      doc.save(fileName);
-      setSuccessMessage(`Berhasil disimpan sebagai ${fileName}!`);
+      setSavedFileName(fileName);
+
+      // Check if running as native Android APK
+      if (Capacitor.isNativePlatform()) {
+        // Native Android APK Flow via Capacitor Filesystem
+        const dataUri = doc.output('datauristring');
+        const base64Data = dataUri.split(',')[1];
+
+        const savedFile = await Filesystem.writeFile({
+          path: fileName,
+          data: base64Data,
+          directory: Directory.Cache,
+        });
+
+        setSavedNativeUri(savedFile.uri);
+        setShowNotification(true);
+
+        // Automatically open Android native Save/Share Sheet (Drive, Files, Adobe, etc.)
+        await Share.share({
+          title: fileName,
+          text: 'PDF berhasil dibuat!',
+          url: savedFile.uri,
+          dialogTitle: 'Buka atau Simpan PDF',
+        });
+      } else {
+        // Web Browser Flow
+        const pdfBlob = doc.output('blob');
+        const objectUrl = URL.createObjectURL(pdfBlob);
+
+        setDownloadUrl(objectUrl);
+        setShowNotification(true);
+        triggerDownload(objectUrl, fileName);
+      }
     } catch (err) {
       console.error('PDF Generation Error:', err);
-      alert('Gagal membuat PDF. Silakan coba lagi.');
+      alert(`Terjadi kendala: ${(err as Error).message || 'Silakan coba lagi.'}`);
     } finally {
       setIsGenerating(false);
+      setProgressText('');
     }
   };
 
   return (
-    <div className="min-h-screen bg-[#FFD7D7] flex flex-col items-center justify-start antialiased selection:bg-[#FF1F87]/20">
+    <div className="min-h-screen bg-[#FFD7D7] flex flex-col items-center justify-start antialiased selection:bg-[#FF1F87]/20 relative">
+      
+      {/* 🔔 Native Mobile & Web In-App Notification Card */}
+      {showNotification && (
+        <div className="fixed top-3 left-1/2 -translate-x-1/2 w-[92%] max-w-[400px] z-50 animate-in fade-in slide-in-from-top-4 duration-300">
+          <div className="bg-[#A56464] text-[#FFDCDC] rounded-[24px] p-4 shadow-2xl border-2 border-[#FDBCBC] flex flex-col gap-3">
+            {/* Header */}
+            <div className="flex items-start justify-between">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-full bg-[#FDBCBC] flex items-center justify-center text-[#A56464] shadow-sm flex-shrink-0">
+                  <Sparkles className="w-4 h-4" />
+                </div>
+                <div>
+                  <h4 className="text-xs font-mono font-bold text-white tracking-wide">
+                    PDF BERHASIL DIBUAT!
+                  </h4>
+                  <p className="text-[11px] font-mono text-[#FFDCDC]/90 truncate max-w-[210px]">
+                    {savedFileName}
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowNotification(false)}
+                className="w-6 h-6 rounded-full bg-[#B27878] hover:bg-[#8f5555] text-[#FFDCDC] flex items-center justify-center transition-colors cursor-pointer"
+                title="Tutup Notifikasi"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+
+            {/* Quick Status Pill */}
+            <div className="bg-[#B27878]/60 rounded-xl px-3 py-1.5 flex items-center justify-between text-[10px] font-mono">
+              <span className="text-[#FFDCDC]">Halaman: {images.length}</span>
+              <span className="text-white font-medium flex items-center gap-1">
+                <CheckCircle2 className="w-3 h-3 text-green-300" />
+                Siap Disimpan
+              </span>
+            </div>
+
+            {/* Primary Action Button (Works on both Android APK & Web) */}
+            <div className="flex flex-col gap-2 pt-1">
+              <button
+                onClick={handleOpenOrShare}
+                className="w-full h-[40px] bg-[#FDBCBC] hover:bg-[#fcabab] text-[#A56464] font-mono font-bold rounded-[14px] flex items-center justify-center gap-2 text-xs transition-all active:scale-95 shadow-md cursor-pointer"
+              >
+                <Download className="w-4 h-4" />
+                <span>📥 SIMPAN / BUKA FILE PDF</span>
+              </button>
+
+              {downloadUrl && !Capacitor.isNativePlatform() && (
+                <a
+                  href={downloadUrl}
+                  download={savedFileName}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="w-full h-[32px] bg-[#B27878] hover:bg-[#915454] text-white font-mono text-[11px] rounded-[10px] flex items-center justify-center gap-1.5 transition-all active:scale-95 text-center"
+                >
+                  <Share2 className="w-3 h-3" />
+                  <span>Unduh Manual Browser</span>
+                </a>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Mobile Frame Container (Max 422px width matching Figma Android frame) */}
       <div className="w-full max-w-[422px] min-h-screen flex flex-col items-center relative pb-8 shadow-sm">
         
@@ -224,7 +402,7 @@ export default function Home() {
               ref={fileInputRef}
               type="file"
               multiple
-              accept="image/png, image/jpeg, image/jpg, image/webp"
+              accept="image/*"
               className="hidden"
               onChange={(e) => handleFiles(e.target.files)}
             />
@@ -263,7 +441,12 @@ export default function Home() {
                     {images.length} Gambar Dipilih
                   </span>
                   <button
-                    onClick={() => setImages([])}
+                    onClick={() => {
+                      setImages([]);
+                      setDownloadUrl(null);
+                      setSavedNativeUri(null);
+                      setShowNotification(false);
+                    }}
                     className="text-[11px] text-[#A56464] hover:text-[#914646] font-mono underline cursor-pointer"
                   >
                     Hapus Semua
@@ -359,7 +542,7 @@ export default function Home() {
                 type="text"
                 value={pdfName}
                 onChange={(e) => setPdfName(e.target.value)}
-                placeholder="Nama file PDF "
+                placeholder="Nama file PDF (opsional)..."
                 className="w-full bg-transparent text-xs text-[#A56464] placeholder-[#DF7A7A]/70 font-mono font-medium focus:outline-none"
               />
               <span className="text-[10px] bg-[#E59D9D]/40 text-[#A56464] px-1.5 py-0.5 rounded font-mono font-medium flex-shrink-0 select-none">
@@ -380,7 +563,7 @@ export default function Home() {
               {isGenerating ? (
                 <>
                   <Loader2 className="w-4 h-4 text-[#B27878] animate-spin" />
-                  <span>Memproses PDF...</span>
+                  <span className="text-xs">{progressText || 'Memproses PDF...'}</span>
                 </>
               ) : (
                 <>
@@ -393,14 +576,6 @@ export default function Home() {
               )}
             </button>
           </div>
-
-          {/* Success Notification */}
-          {successMessage && (
-            <div className="w-full max-w-[369px] bg-[#A56464] text-[#FFDCDC] text-xs font-mono py-2 px-3 rounded-xl flex items-center gap-2 animate-fade-in flex-shrink-0">
-              <FileCheck2 className="w-4 h-4 flex-shrink-0" />
-              <span className="truncate">{successMessage}</span>
-            </div>
-          )}
         </main>
       </div>
     </div>
